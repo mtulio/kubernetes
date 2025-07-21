@@ -43,17 +43,178 @@ import (
 	netutils "k8s.io/utils/net"
 )
 
+// Proxy Protocol v2 constants and structures
+const (
+	proxyProtocolV2Signature = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
+	proxyProtocolV2MinLength = 16
+)
+
+// ProxyProtocolInfo holds the original client connection information
+type ProxyProtocolInfo struct {
+	SrcIP   string
+	SrcPort string
+	DstIP   string
+	DstPort string
+}
+
+// proxyProtocolConn wraps a net.Conn and stores proxy protocol information
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *ProxyProtocolInfo
+}
+
+// parseProxyProtocolV2 parses the proxy protocol v2 header and returns the original client info
+func parseProxyProtocolV2(data []byte) (*ProxyProtocolInfo, int, error) {
+	if len(data) < proxyProtocolV2MinLength {
+		return nil, 0, fmt.Errorf("insufficient data for proxy protocol v2")
+	}
+
+	// Check signature
+	if string(data[:12]) != proxyProtocolV2Signature {
+		return nil, 0, fmt.Errorf("invalid proxy protocol v2 signature")
+	}
+
+	// Parse version and command
+	versionCmd := data[12]
+	version := (versionCmd & 0xF0) >> 4
+	cmd := versionCmd & 0x0F
+
+	if version != 2 {
+		return nil, 0, fmt.Errorf("unsupported proxy protocol version: %d", version)
+	}
+
+	// Parse address family and protocol
+	familyProtocol := data[13]
+	family := (familyProtocol & 0xF0) >> 4
+	protocol := familyProtocol & 0x0F
+
+	// Parse length
+	length := int(data[14])<<8 | int(data[15])
+	totalLength := 16 + length
+
+	if len(data) < totalLength {
+		return nil, 0, fmt.Errorf("insufficient data for proxy protocol v2 payload")
+	}
+
+	// If command is LOCAL (0x0), ignore address info
+	if cmd == 0x0 {
+		return &ProxyProtocolInfo{}, totalLength, nil
+	}
+
+	// Parse address information based on family and protocol
+	if family == 0x1 && protocol == 0x1 { // IPv4 TCP
+		if length < 12 {
+			return nil, 0, fmt.Errorf("insufficient address data for IPv4 TCP")
+		}
+		srcIP := fmt.Sprintf("%d.%d.%d.%d", data[16], data[17], data[18], data[19])
+		dstIP := fmt.Sprintf("%d.%d.%d.%d", data[20], data[21], data[22], data[23])
+		srcPort := fmt.Sprintf("%d", int(data[24])<<8|int(data[25]))
+		dstPort := fmt.Sprintf("%d", int(data[26])<<8|int(data[27]))
+
+		return &ProxyProtocolInfo{
+			SrcIP:   srcIP,
+			SrcPort: srcPort,
+			DstIP:   dstIP,
+			DstPort: dstPort,
+		}, totalLength, nil
+	} else if family == 0x2 && protocol == 0x1 { // IPv6 TCP
+		if length < 36 {
+			return nil, 0, fmt.Errorf("insufficient address data for IPv6 TCP")
+		}
+		srcIP := net.IP(data[16:32]).String()
+		dstIP := net.IP(data[32:48]).String()
+		srcPort := fmt.Sprintf("%d", int(data[48])<<8|int(data[49]))
+		dstPort := fmt.Sprintf("%d", int(data[50])<<8|int(data[51]))
+
+		return &ProxyProtocolInfo{
+			SrcIP:   srcIP,
+			SrcPort: srcPort,
+			DstIP:   dstIP,
+			DstPort: dstPort,
+		}, totalLength, nil
+	}
+
+	// For unsupported families/protocols, just return empty info
+	return &ProxyProtocolInfo{}, totalLength, nil
+}
+
+// proxyProtocolListener wraps a net.Listener to handle proxy protocol v2
+type proxyProtocolListener struct {
+	net.Listener
+}
+
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read potential proxy protocol header
+	buf := make([]byte, 108) // Max proxy protocol v2 header size
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Read(buf)
+	conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read proxy protocol header: %v", err)
+	}
+
+	proxyInfo, headerLen, parseErr := parseProxyProtocolV2(buf[:n])
+	if parseErr != nil {
+		// If parsing fails, assume no proxy protocol and return the connection
+		// with the read data prepended
+		wrappedConn := &bufferConn{
+			Conn:   conn,
+			buffer: buf[:n],
+		}
+		return &proxyProtocolConn{Conn: wrappedConn, proxyInfo: &ProxyProtocolInfo{}}, nil
+	}
+
+	// If we read more data than the proxy protocol header, prepend the extra data
+	var wrappedConn net.Conn = conn
+	if n > headerLen {
+		wrappedConn = &bufferConn{
+			Conn:   conn,
+			buffer: buf[headerLen:n],
+		}
+	}
+
+	return &proxyProtocolConn{Conn: wrappedConn, proxyInfo: proxyInfo}, nil
+}
+
+// bufferConn wraps a connection and prepends buffered data to reads
+type bufferConn struct {
+	net.Conn
+	buffer     []byte
+	bufferRead bool
+}
+
+func (c *bufferConn) Read(b []byte) (int, error) {
+	if !c.bufferRead && len(c.buffer) > 0 {
+		n := copy(b, c.buffer)
+		if n < len(c.buffer) {
+			c.buffer = c.buffer[n:]
+		} else {
+			c.bufferRead = true
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
 var (
-	httpPort           = 8080
-	udpPort            = 8081
-	sctpPort           = -1
-	shellPath          = "/bin/sh"
-	serverReady        = &atomicBool{0}
-	certFile           = ""
-	privKeyFile        = ""
-	httpOverride       = ""
-	udpListenAddresses = ""
-	delayShutdown      = 0
+	httpPort              = 8080
+	udpPort               = 8081
+	sctpPort              = -1
+	shellPath             = "/bin/sh"
+	serverReady           = &atomicBool{0}
+	certFile              = ""
+	privKeyFile           = ""
+	httpOverride          = ""
+	udpListenAddresses    = ""
+	delayShutdown         = 0
+	enableProxyProtocolV2 = false
 )
 
 const bindToAny = ""
@@ -144,6 +305,7 @@ func init() {
 	CmdNetexec.Flags().StringVar(&httpOverride, "http-override", "", "Override the HTTP handler to always respond as if it were a GET with this path & params")
 	CmdNetexec.Flags().StringVar(&udpListenAddresses, "udp-listen-addresses", "", "A comma separated list of ip addresses the udp servers listen from")
 	CmdNetexec.Flags().IntVar(&delayShutdown, "delay-shutdown", 0, "Number of seconds to delay shutdown when receiving SIGTERM.")
+	CmdNetexec.Flags().BoolVar(&enableProxyProtocolV2, "enable-proxy-protocol-v2", false, "Enable Proxy Protocol v2 support")
 }
 
 // atomicBool uses load/store operations on an int32 to simulate an atomic boolean.
@@ -202,6 +364,9 @@ func main(cmd *cobra.Command, args []string) {
 		addRoutes(http.DefaultServeMux, sigTermReceived, exitCh)
 	}
 
+	// Use default mux as handler
+	var handler http.Handler = http.DefaultServeMux
+
 	// UDP server
 	if udpPort != -1 {
 		udpBindTo, err := parseAddresses(udpListenAddresses)
@@ -219,11 +384,41 @@ func main(cmd *cobra.Command, args []string) {
 		go startSCTPServer(sctpPort)
 	}
 
-	server := &http.Server{Addr: fmt.Sprintf(":%d", httpPort)}
-	if len(certFile) > 0 {
-		startServer(server, exitCh, func() error { return server.ListenAndServeTLS(certFile, privKeyFile) })
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", httpPort),
+		Handler: handler,
+	}
+
+	// Add ConnContext to inject proxy protocol info into request context
+	if enableProxyProtocolV2 {
+		server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+			if ppConn, ok := c.(*proxyProtocolConn); ok {
+				return context.WithValue(ctx, proxyProtocolContextKey, ppConn.proxyInfo)
+			}
+			return ctx
+		}
+	}
+
+	if enableProxyProtocolV2 {
+		// Create custom listener with proxy protocol support
+		addr := fmt.Sprintf(":%d", httpPort)
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		proxyListener := &proxyProtocolListener{Listener: listener}
+
+		if len(certFile) > 0 {
+			startServer(server, exitCh, func() error { return server.ServeTLS(proxyListener, certFile, privKeyFile) })
+		} else {
+			startServer(server, exitCh, func() error { return server.Serve(proxyListener) })
+		}
 	} else {
-		startServer(server, exitCh, server.ListenAndServe)
+		if len(certFile) > 0 {
+			startServer(server, exitCh, func() error { return server.ListenAndServeTLS(certFile, privKeyFile) })
+		} else {
+			startServer(server, exitCh, server.ListenAndServe)
+		}
 	}
 }
 
@@ -288,7 +483,28 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 
 func clientIPHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("GET /clientip")
-	fmt.Fprint(w, r.RemoteAddr)
+
+	// Try to get the original client IP from proxy protocol if available
+	clientIP := getClientIP(r)
+	fmt.Fprint(w, clientIP)
+}
+
+// Context key for proxy protocol information
+type contextKey string
+
+const proxyProtocolContextKey contextKey = "proxyProtocol"
+
+// getClientIP extracts the client IP, preferring proxy protocol info if available
+func getClientIP(r *http.Request) string {
+	if enableProxyProtocolV2 {
+		// Try to extract proxy protocol info from context
+		if proxyInfo, ok := r.Context().Value(proxyProtocolContextKey).(*ProxyProtocolInfo); ok && proxyInfo != nil && proxyInfo.SrcIP != "" {
+			return net.JoinHostPort(proxyInfo.SrcIP, proxyInfo.SrcPort)
+		}
+	}
+
+	// Fallback to standard RemoteAddr
+	return r.RemoteAddr
 }
 
 func serverPortHandler(w http.ResponseWriter, r *http.Request) {
